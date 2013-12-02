@@ -333,6 +333,7 @@ pub struct CrateTranslation {
     module: ModuleRef,
     link: LinkMeta,
     crate_types: ~[~str],
+    reachable_symbols: ~[~str],
 }
 
 /// Run the translation phase to LLVM, after which the AST and analysis can
@@ -392,10 +393,9 @@ pub fn phase_6_link_output(sess: Session,
                            outputs: &OutputFilenames) {
     time(sess.time_passes(), "linking", (), |_|
          link::link_binary(sess,
-                           trans.crate_types,
+                           trans,
                            &outputs.obj_filename,
-                           &outputs.out_filename,
-                           trans.link));
+                           &outputs.out_filename))
 }
 
 pub fn stop_after_phase_3(sess: Session) -> bool {

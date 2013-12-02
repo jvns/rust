@@ -344,6 +344,8 @@ pub fn trans_native_call(bcx: @mut Block,
 pub fn trans_foreign_mod(ccx: @mut CrateContext,
                          foreign_mod: &ast::foreign_mod) {
     let _icx = push_ctxt("foreign::trans_foreign_mod");
+    if foreign_mod.abis.is_intrinsic() { return }
+
     for &foreign_item in foreign_mod.items.iter() {
         match foreign_item.node {
             ast::foreign_item_fn(..) => {

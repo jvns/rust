@@ -12,9 +12,16 @@
 //! the stndard library This varies per-platform, but these libraries are
 //! necessary for running libstd.
 
+#[doc(hidden)];
+
 // All platforms need to link to rustrt
 #[link(name = "rustrt", kind = "static")]
-extern {}
+extern {
+    // these functions need to be public here, representing that they're
+    // exported for usage by all other libraries linking to libstd
+    pub fn upcall_rust_personality() -> i32;
+    pub fn upcall_reset_stack_limit();
+}
 
 // LLVM implements the `frem` instruction as a call to `fmod`, which lives in
 // libm. Hence, we must explicitly link to it.

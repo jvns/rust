@@ -524,7 +524,7 @@ pub unsafe fn guess_handle(handle: c_int) -> c_int {
 // second copies of everything. We obviously don't want this, so instead of
 // dying horribly during testing, we allow all of the test rustuv's references
 // to get resolved to the original rustuv crate.
-#[cfg(not(test), not(stage0))]
+#[cfg(not(stage0))]
 #[link(name = "uv_support", kind = "static")]
 #[link(name = "uv", kind = "static")]
 extern {}

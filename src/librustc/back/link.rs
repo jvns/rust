@@ -11,6 +11,7 @@
 
 use back::archive::Archive;
 use back::rpath;
+use driver::driver::CrateTranslation;
 use driver::session::Session;
 use driver::session;
 use lib::llvm::llvm;
@@ -32,6 +33,8 @@ use std::ptr;
 use std::run;
 use std::str;
 use std::io::fs;
+use std::io::buffered::BufferedWriter;
+use extra::tempfile::TempDir;
 use syntax::abi;
 use syntax::ast;
 use syntax::ast_map::{path, path_mod, path_name, path_pretty_name};
@@ -895,10 +898,9 @@ pub fn get_cc_prog(sess: Session) -> ~str {
 /// Perform the linkage portion of the compilation phase. This will generate all
 /// of the requested outputs for this compilation session.
 pub fn link_binary(sess: Session,
-                   crate_types: &[~str],
+                   trans: &CrateTranslation,
                    obj_filename: &Path,
-                   out_filename: &Path,
-                   lm: LinkMeta) {
+                   out_filename: &Path) {
     let outputs = if sess.opts.test {
         // If we're generating a test executable, then ignore all other output
         // styles at all other locations
@@ -908,7 +910,7 @@ pub fn link_binary(sess: Session,
         // look at what was in the crate file itself for generating output
         // formats.
         let mut outputs = sess.opts.outputs.clone();
-        for ty in crate_types.iter() {
+        for ty in trans.crate_types.iter() {
             if "bin" == *ty {
                 outputs.push(session::OutputExecutable);
             } else if "dylib" == *ty || "lib" == *ty {
@@ -926,7 +928,7 @@ pub fn link_binary(sess: Session,
     };
 
     for output in outputs.move_iter() {
-        link_binary_output(sess, output, obj_filename, out_filename, lm);
+        link_binary_output(sess, output, obj_filename, out_filename, trans);
     }
 
     // Remove the temporary object file if we aren't saving temps
@@ -948,8 +950,8 @@ fn link_binary_output(sess: Session,
                       output: session::OutputStyle,
                       obj_filename: &Path,
                       out_filename: &Path,
-                      lm: LinkMeta) {
-    let libname = output_lib_filename(lm);
+                      trans: &CrateTranslation) {
+    let libname = output_lib_filename(trans.link);
     let out_filename = match output {
         session::OutputRlib => {
             out_filename.with_filename(format!("lib{}.rlib", libname))
@@ -993,10 +995,10 @@ fn link_binary_output(sess: Session,
             link_staticlib(sess, obj_filename, &out_filename);
         }
         session::OutputExecutable => {
-            link_natively(sess, false, obj_filename, &out_filename);
+            link_natively(sess, false, obj_filename, &out_filename, trans);
         }
         session::OutputDylib => {
-            link_natively(sess, true, obj_filename, &out_filename);
+            link_natively(sess, true, obj_filename, &out_filename, trans);
         }
     }
 }
@@ -1055,11 +1057,13 @@ fn link_staticlib(sess: Session, obj_filename: &Path, out_filename: &Path) {
 // This will invoke the system linker/cc to create the resulting file. This
 // links to all upstream files as well.
 fn link_natively(sess: Session, dylib: bool, obj_filename: &Path,
-                 out_filename: &Path) {
+                 out_filename: &Path, trans: &CrateTranslation) {
+    let tmpdir = TempDir::new("rustc").expect("rustc needs a tempdir");
     // The invocations of cc share some flags across platforms
     let cc_prog = get_cc_prog(sess);
     let mut cc_args = sess.targ_cfg.target_strs.cc_args.clone();
-    cc_args.push_all_move(link_args(sess, dylib, obj_filename, out_filename));
+    cc_args.push_all_move(link_args(sess, dylib, obj_filename, out_filename,
+                                    trans, tmpdir.path()));
     if (sess.opts.debugging_opts & session::print_link_args) != 0 {
         println!("{} link args: '{}'", cc_prog, cc_args.connect("' '"));
     }
@@ -1072,6 +1076,7 @@ fn link_natively(sess: Session, dylib: bool, obj_filename: &Path,
     let prog = run::process_output(cc_prog, cc_args);
 
     if !prog.status.success() {
+        tmpdir.unwrap(); // allows debugging what just happened
         sess.err(format!("linking with `{}` failed: {}", cc_prog, prog.status));
         sess.note(format!("{} arguments: '{}'", cc_prog, cc_args.connect("' '")));
         sess.note(str::from_utf8(prog.error + prog.output));
@@ -1091,7 +1096,9 @@ fn link_natively(sess: Session, dylib: bool, obj_filename: &Path,
 fn link_args(sess: Session,
              dylib: bool,
              obj_filename: &Path,
-             out_filename: &Path) -> ~[~str] {
+             out_filename: &Path,
+             trans: &CrateTranslation,
+             tmpdir: &Path) -> ~[~str] {
 
     // The default library location, we need this to find the runtime.
     // The location of crates will be determined as needed.
@@ -1111,14 +1118,60 @@ fn link_args(sess: Session,
         // don't actually fulfill any relocations, but only for libraries which
         // follow this flag. Thus, use it before specifing libraries to link to.
         args.push(~"-Wl,--as-needed");
+    }
 
-        // GNU-style linkers support optimization with -O. --gc-sections
-        // removes metadata and potentially other useful things, so don't
-        // include it. GNU ld doesn't need a numeric argument, but other linkers
-        // do.
-        if sess.opts.optimize == session::Default ||
-           sess.opts.optimize == session::Aggressive {
+    // Instruct the linker to only export the symbols that are reachable in the
+    // final product. All others (like those from native libraries and static
+    // rust libraries) should be hidden if their names aren't reachable.
+    let path = tmpdir.join("exported_symbols_list.def");
+    let mut f = BufferedWriter::new(fs::File::create(&path));
+    {
+        let f = &mut f as &mut Writer;
+        match sess.targ_cfg.os {
+            abi::OsMacos => {
+                for sym in trans.reachable_symbols.iter() {
+                    writeln!(f, "_{}", *sym);
+                }
+                args.push(format!("-Wl,-exported_symbols_list,{}",
+                                  path.display()));
+            }
+            abi::OsLinux | abi::OsAndroid | abi::OsFreebsd => {
+                writeln!(f, r"\{");
+                if trans.reachable_symbols.len() > 0 {
+                    writeln!(f, "global: ");
+                }
+                for sym in trans.reachable_symbols.iter() {
+                    writeln!(f, "{};", *sym);
+                }
+                writeln!(f, "local: *;");
+                writeln!(f, r"\};");
+                args.push(format!("-Wl,--export-dynamic,--version-script={}",
+                                  path.display()));
+            }
+            abi::OsWin32 => {
+                writeln!(f, "LIBRARY {0}/{0}", trans.link.name);
+                writeln!(f, "EXPORTS");
+                for sym in trans.reachable_symbols.iter() {
+                    writeln!(f, "    {}", *sym);
+                }
+                args.push(format!("{}", path.display()));
+            }
+        }
+    }
+    f.flush();
+
+    // Apply various optimizations to reduce the size of the output
+    if sess.opts.optimize == session::Default ||
+       sess.opts.optimize == session::Aggressive {
+        // GNU-style linkers support optimization with -O. GNU ld doesn't need a
+        // numeric argument, but other linkers do.
+        if sess.targ_cfg.os == abi::OsLinux {
             args.push(~"-Wl,-O1");
+        }
+
+        match sess.targ_cfg.os {
+            abi::OsMacos => args.push(~"-Wl,-dead_strip"),
+            _ => args.push(~"-Wl,--gc-sections"),
         }
     }
 

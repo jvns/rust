@@ -2961,21 +2961,27 @@ pub fn create_module_map(ccx: &mut CrateContext) -> (ValueRef, uint) {
     return (map, keys.len())
 }
 
+pub fn symname(sess: session::Session, name: &str,
+               hash: &str, vers: &str) -> ~str {
+    let elt = path_name(sess.ident_of(name));
+    link::exported_name(sess, ~[elt], hash, vers)
+}
 
 pub fn decl_crate_map(sess: session::Session, mapmeta: LinkMeta,
-                      llmod: ModuleRef) -> ValueRef {
+                      llmod: ModuleRef) -> (~str, ValueRef) {
     let targ_cfg = sess.targ_cfg;
     let int_type = Type::int(targ_cfg.arch);
     let mut n_subcrates = 1;
     let cstore = sess.cstore;
     while cstore::have_crate_data(cstore, n_subcrates) { n_subcrates += 1; }
-    let mapname = if *sess.building_library && !sess.gen_crate_map() {
-        format!("{}_{}_{}", mapmeta.name, mapmeta.vers, mapmeta.extras_hash)
+    let is_top = !*sess.building_library || sess.gen_crate_map();
+    let sym_name = if is_top {
+        ~"_rust_crate_map_toplevel"
     } else {
-        ~"toplevel"
+        symname(sess, "_rust_crate_map_" + mapmeta.name, mapmeta.extras_hash,
+                mapmeta.vers)
     };
 
-    let sym_name = ~"_rust_crate_map_" + mapname;
     let slicetype = Type::struct_([int_type, int_type], false);
     let maptype = Type::struct_([
         Type::i32(),        // version
@@ -2990,13 +2996,13 @@ pub fn decl_crate_map(sess: session::Session, mapmeta: LinkMeta,
     });
     // On windows we'd like to export the toplevel cratemap
     // such that we can find it from libstd.
-    if targ_cfg.os == OsWin32 && "toplevel" == mapname {
+    if targ_cfg.os == OsWin32 && is_top {
         lib::llvm::SetLinkage(map, lib::llvm::DLLExportLinkage);
     } else {
         lib::llvm::SetLinkage(map, lib::llvm::ExternalLinkage);
     }
 
-    return map;
+    return (sym_name, map);
 }
 
 pub fn fill_crate_map(ccx: @mut CrateContext, map: ValueRef) {
@@ -3005,10 +3011,9 @@ pub fn fill_crate_map(ccx: @mut CrateContext, map: ValueRef) {
     let cstore = ccx.sess.cstore;
     while cstore::have_crate_data(cstore, i) {
         let cdata = cstore::get_crate_data(cstore, i);
-        let nm = format!("_rust_crate_map_{}_{}_{}",
-                      cdata.name,
-                      cstore::get_crate_vers(cstore, i),
-                      cstore::get_crate_hash(cstore, i));
+        let nm = symname(ccx.sess, format!("_rust_crate_map_{}", cdata.name),
+                         cstore::get_crate_hash(cstore, i),
+                         cstore::get_crate_vers(cstore, i));
         let cr = nm.with_c_str(|buf| {
             unsafe {
                 llvm::LLVMAddGlobal(ccx.llmod, ccx.int_type.to_ref(), buf)
@@ -3078,8 +3083,8 @@ pub fn crate_ctxt_to_encode_parms<'r>(cx: &'r CrateContext, ie: encoder::encode_
         }
 }
 
-pub fn write_metadata(cx: &CrateContext, crate: &ast::Crate) {
-    if !*cx.sess.building_library { return; }
+pub fn write_metadata(cx: &CrateContext, crate: &ast::Crate) -> Option<~str> {
+    if !*cx.sess.building_library { return None }
 
     let encode_inlined_item: encoder::encode_inlined_item =
         |ecx, ebml_w, path, ii|
@@ -3088,26 +3093,18 @@ pub fn write_metadata(cx: &CrateContext, crate: &ast::Crate) {
     let encode_parms = crate_ctxt_to_encode_parms(cx, encode_inlined_item);
     let llmeta = C_bytes(encoder::encode_metadata(encode_parms, crate));
     let llconst = C_struct([llmeta], false);
-    let mut llglobal = "rust_metadata".with_c_str(|buf| {
-        unsafe {
-            llvm::LLVMAddGlobal(cx.llmod, val_ty(llconst).to_ref(), buf)
-        }
-    });
+    let name = symname(cx.sess, format!("rust_metadata_{}", cx.link_meta.name),
+                       cx.link_meta.extras_hash, cx.link_meta.vers);
     unsafe {
+        let llglobal = name.with_c_str(|buf| {
+            llvm::LLVMAddGlobal(cx.llmod, val_ty(llconst).to_ref(), buf)
+        });
         llvm::LLVMSetInitializer(llglobal, llconst);
         cx.sess.targ_cfg.target_strs.meta_sect_name.with_c_str(|buf| {
             llvm::LLVMSetSection(llglobal, buf)
         });
-        lib::llvm::SetLinkage(llglobal, lib::llvm::InternalLinkage);
-
-        let t_ptr_i8 = Type::i8p();
-        llglobal = llvm::LLVMConstBitCast(llglobal, t_ptr_i8.to_ref());
-        let llvm_used = "llvm.used".with_c_str(|buf| {
-            llvm::LLVMAddGlobal(cx.llmod, Type::array(&t_ptr_i8, 1).to_ref(), buf)
-        });
-        lib::llvm::SetLinkage(llvm_used, lib::llvm::AppendingLinkage);
-        llvm::LLVMSetInitializer(llvm_used, C_array(t_ptr_i8, [llglobal]));
     }
+    Some(name)
 }
 
 pub fn trans_crate(sess: session::Session,
@@ -3174,7 +3171,7 @@ pub fn trans_crate(sess: session::Session,
     }
 
     // Translate the metadata.
-    write_metadata(ccx, &crate);
+    let metadata_name = write_metadata(ccx, &crate);
     if ccx.sess.trans_stats() {
         println("--- trans stats ---");
         println!("n_static_tydescs: {}", ccx.stats.n_static_tydescs);
@@ -3216,10 +3213,20 @@ pub fn trans_crate(sess: session::Session,
         }
     }).map(|a| a.to_owned()).collect();
 
+    let mut reachable_symbols = analysis.reachable.iter().filter_map(|a| {
+        ccx.item_symbols.find(a).map(|s| s.to_owned())
+    }).to_owned_vec();
+    match metadata_name {
+        Some(name) => reachable_symbols.push(name),
+        None => {}
+    }
+    reachable_symbols.push(ccx.crate_map_name.to_owned());
+
     return CrateTranslation {
         context: llcx,
         module: llmod,
         link: link_meta,
         crate_types: crate_types,
+        reachable_symbols: reachable_symbols,
     };
 }

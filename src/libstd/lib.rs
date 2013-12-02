@@ -82,7 +82,7 @@
 #[cfg(test)] pub use ops = realstd::ops;
 #[cfg(test)] pub use cmp = realstd::cmp;
 
-mod rtdeps;
+pub mod rtdeps;
 
 /* The Prelude. */
 
